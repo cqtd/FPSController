@@ -1,13 +1,17 @@
 ﻿using System;
 using System.Linq;
+using NUnit.Framework;
 using UnityEngine;
 
 namespace Cqunity
 {
 	[RequireComponent(typeof(Rigidbody))]
 	[RequireComponent(typeof(Collider))]
-	public class ControllerBase : MonoBehaviour
+	public class PawnBase : MonoBehaviour
 	{
+		
+		#region Data Types
+
 		[Serializable]
 		public class MovementConfiguration : IConfiguration<MovementConfiguration>
 		{
@@ -16,12 +20,15 @@ namespace Cqunity
 			public float movementSmoothness = default;
 			public float jumpForce = default;
 
+			public bool allowChangeDirectionDuringJump = default;
+
 			public MovementConfiguration GetDefault()
 			{
 				walkingSpeed = 5f;
 				runningSpeed = 9f;
 				movementSmoothness = 0.125f;
 				jumpForce = 35f;
+				allowChangeDirectionDuringJump = false;
 
 				return this;
 			}
@@ -45,14 +52,43 @@ namespace Cqunity
 				return this;
 			}
 		}
-		
-		[SerializeField] private Rigidbody m_rigidbody = default;
-		[SerializeField] private Collider m_collider = default;
-		
-		[SerializeField] private Transform m_arms = default;
-		[SerializeField] private MovementConfiguration m_movementConfig = default;
-		[SerializeField] private LockConfiguration m_lockConfig = default;
 
+		[Serializable]
+		public struct PossessConfiguration
+		{
+			public bool allowPossess;
+			public bool allowPossessOverride;
+			public bool allowUnpossessByNonOwner;
+			
+			public PossessConfiguration GetDefault()
+			{
+				this.allowPossess = true;
+				this.allowPossessOverride = false;
+				this.allowUnpossessByNonOwner = false;
+				
+				return this;
+			}
+		}
+
+		#endregion
+
+		#region Edittable Fields
+		
+		[SerializeField] protected Rigidbody m_rigidbody = default;
+		[SerializeField] protected Collider m_collider = default;
+		
+		[SerializeField] protected Transform m_arms = default;
+		[SerializeField] protected Vector3 m_armPositionOffset = default;
+		
+		[Header("Configuration")]
+		[SerializeField] protected MovementConfiguration m_movementConfig = default;
+		[SerializeField] protected LockConfiguration m_lockConfig = default;
+		[SerializeField] protected PossessConfiguration m_possessConfig = default;
+
+		#endregion
+
+		#region Internal Members
+		
 		protected SmoothRotation m_rotationX = default;
 		protected SmoothRotation m_rotationY = default;
 
@@ -61,10 +97,16 @@ namespace Cqunity
 
 		protected bool bIsGrounded = default;
 
-		private RaycastHit[] m_groundCastResultArray;
-		private RaycastHit[] m_wallCastResultArray;
+		protected RaycastHit[] m_groundCastResultArray;
+		protected RaycastHit[] m_wallCastResultArray;
 
-		private const int RAYCAST_CAPACITY = 8;
+		protected PlayerControllerBase m_controller = default;
+
+		protected const int RAYCAST_CAPACITY = 8;
+		
+		#endregion
+
+		#region Unity Events
 
 		private void Awake()
 		{
@@ -88,6 +130,7 @@ namespace Cqunity
 			
 			m_movementConfig = new MovementConfiguration().GetDefault();
 			m_lockConfig = new LockConfiguration().GetDefault();
+			m_possessConfig = new PossessConfiguration().GetDefault();
 		}
 
 		private void FixedUpdate()
@@ -103,26 +146,138 @@ namespace Cqunity
 			Jump();
 		}
 
+		private void OnCollisionStay()
+		{
+			OnStayCollisionEvent();
+		}
+		
+		#endregion
+
+		#region Possess
+
+		public PossessConfiguration PossesingConfig {
+			get
+			{
+				return m_possessConfig;
+			}
+		}
+
+		public void Possess(PlayerControllerBase playerController)
+		{
+			if (!m_possessConfig.allowPossess)
+			{
+				Assert.IsTrue(m_possessConfig.allowPossess);
+				Debug.LogError("빙의가 허용되지 않는 폰입니다.");
+				return;
+			}
+
+			if (!m_possessConfig.allowPossessOverride)
+			{
+				if (m_controller != null)
+				{
+					Assert.IsTrue(m_possessConfig.allowPossessOverride);
+					Debug.LogError("빙의 오버라이드가 허용되지 않는 폰입니다.");
+					return;
+				}
+			
+				// 이미 연결된 컨트롤러가 있는 경우 디스커넥트
+				m_controller.pawnDisconnectPossessing.Invoke(this);
+			}
+			
+			this.m_controller = playerController;
+			m_controller.onPawnPossessed?.Invoke(this);
+		}
+
+		public bool Unpossess(PlayerControllerBase playerController)
+		{
+			if (!ReferenceEquals(m_controller, playerController))
+			{
+				if (!m_possessConfig.allowUnpossessByNonOwner)
+				{
+					Assert.IsTrue(m_possessConfig.allowUnpossessByNonOwner);
+					Debug.LogError("빙의 주체가 아닌 다른 컨트롤러부터 해제가 허용되지 않는 폰입니다.");
+					
+					return false;
+				}
+			}
+			
+			m_controller = null;
+			playerController.onPawnUnpossessed?.Invoke(this);
+			
+			return true;
+		}
+
+		/// <summary>
+		/// 자신의 폰인지 확인할 때
+		/// </summary>
+		/// <param name="playerController"></param>
+		/// <returns></returns>
+		public bool CanControl(PlayerControllerBase playerController)
+		{
+			if (ReferenceEquals(this.m_controller, playerController)) return true;
+			return false;
+		}
+
+		/// <summary>
+		/// 외부 컨트롤러에 의해 통제되고 있음
+		/// </summary>
+		/// <returns></returns>
+		public bool HasControlled()
+		{
+			return m_controller != null;
+		}
+
+		#endregion
+
+		#region Bridge
+
+		/// <summary>
+		/// 커스텀 감도가 적용된 마우스 평행 입력 수치
+		/// </summary>
+		/// <returns></returns>
 		private float GetMouseX()
 		{
-			return Input.GetAxisRaw("Mouse X") * m_lockConfig.mouseSensitivity;
+			if (!HasControlled()) return 0;
+			return m_controller.GetMouseX() * m_lockConfig.mouseSensitivity;
 		}
 
+		/// <summary>
+		/// 커스텀 감도가 적용된 마우스 수직 입력 수치
+		/// </summary>
+		/// <returns></returns>
 		private float GetMouseY()
 		{
-			return Input.GetAxisRaw("Mouse Y") * m_lockConfig.mouseSensitivity;
+			if (!HasControlled()) return 0;
+			return m_controller.GetMouseY() * m_lockConfig.mouseSensitivity;
 		}
 
+		/// <summary>
+		/// 좌우 이동
+		/// </summary>
+		/// <returns></returns>
 		private float GetMove()
 		{
-			return Input.GetAxisRaw("Horizontal");
+			if (!HasControlled()) return 0;
+			return m_controller.GetMove();
 		}
 
+		/// <summary>
+		/// 전후 이동
+		/// </summary>
+		/// <returns></returns>
 		private float GetStrafe()
 		{
-			return Input.GetAxisRaw("Vertical");
+			if (!HasControlled()) return 0;
+			return m_controller.GetStrafe();
 		}
+		
+		#endregion
 
+		#region Basic Movements
+
+		/// <summary>
+		/// 인스턴스 필드 초기화
+		/// </summary>
 		protected virtual void InitializeInstanceFields()
 		{
 			m_rigidbody.constraints = RigidbodyConstraints.FreezeRotation;
@@ -136,6 +291,9 @@ namespace Cqunity
 			m_velocityZ = new SmoothVelocity();
 		}
 
+		/// <summary>
+		/// 회전 제한 검증 로직
+		/// </summary>
 		protected virtual void ValidateRotationRestriction()
 		{
 			ClampRotation(ref m_lockConfig.minVerticalAngle, -90, 90);
@@ -152,6 +310,12 @@ namespace Cqunity
 			m_lockConfig.maxVerticalAngle = tempMinimum;
 		}
 
+		/// <summary>
+		/// 로테이션 클램프 유틸리티
+		/// </summary>
+		/// <param name="rotationRestriction"></param>
+		/// <param name="min"></param>
+		/// <param name="max"></param>
 		private static void ClampRotation(ref float rotationRestriction, float min, float max)
 		{
 			if (rotationRestriction >= min)
@@ -166,25 +330,51 @@ namespace Cqunity
 
 			rotationRestriction = Mathf.Clamp(rotationRestriction, min, max);
 		}
-
-		private void OnCollisionStay()
+		
+		/// <summary>
+		/// 컬리젼 체크
+		/// 로직 확인 후 간소화 필요
+		/// @TODO : 로직 확인
+		/// </summary>
+		private void OnStayCollisionEvent()
 		{
-			var bounds = m_collider.bounds;
-			var extents = bounds.extents;
-			var radius = extents.x - 0.01f;
+			// 그라운드 체크
+			Bounds bounds = m_collider.bounds;
+			
+			Vector3 extents = bounds.extents;
+			float radius = extents.x - 0.01f;
+			
 			Physics.SphereCastNonAlloc(bounds.center, radius, Vector3.down,
 				m_groundCastResultArray, extents.y - radius * 0.5f, ~0, QueryTriggerInteraction.Ignore);
-			if (!m_groundCastResultArray.Any(hit => hit.collider != null && hit.collider != m_collider)) return;
-			for (var i = 0; i < m_groundCastResultArray.Length; i++)
+
+			if (!m_groundCastResultArray.Any(hit => hit.collider != null && hit.collider != m_collider))
+			{
+				return;
+			}
+			
+			for (int i = 0; i < RAYCAST_CAPACITY; i++)
 			{
 				m_groundCastResultArray[i] = new RaycastHit();
 			}
 
 			bIsGrounded = true;
 		}
-		
+
+		/// <summary>
+		/// 폰 움직이기
+		/// @TODO : K-Controller 방식으로 변경하기
+		/// </summary>
 		private void MovePawn()
 		{
+			// 점프 중 방향 바꾸기를 허용하지 않는 경우
+			if (!m_movementConfig.allowChangeDirectionDuringJump)
+			{
+				if (!bIsGrounded)
+				{
+					return;
+				}
+			}
+			
 			// Direction 가져오기
 			Vector3 direction = new Vector3(GetMove(), 0f, GetStrafe());
 			Vector3 worldDirection = transform.TransformDirection(direction);
@@ -208,6 +398,12 @@ namespace Cqunity
 			m_rigidbody.AddForce(enforcemenet, ForceMode.VelocityChange);
 		}
 
+		/// <summary>
+		/// 움직이기 전 이동가능한지 물리로 체크
+		/// 디테일하게 수정할 필요성 있음
+		/// </summary>
+		/// <param name="velocity"></param>
+		/// <returns></returns>
 		private bool DetectWall(Vector3 velocity)
 		{
 			if (bIsGrounded) return false;
@@ -243,6 +439,9 @@ namespace Cqunity
 
 		}
 
+		/// <summary>
+		/// 카메라, 폰 회전 수행
+		/// </summary>
 		private void RotateCameraAndPawn()
 		{
 			m_rotationX.Update(GetMouseX(), m_lockConfig.rotationSmoothness, out float rotX);
@@ -259,6 +458,10 @@ namespace Cqunity
 			m_arms.rotation = rotation;
 		}
 
+		/// <summary>
+		/// 수직 각도 제한
+		/// </summary>
+		/// <param name="mouseY"></param>
 		private void RestrictVerticalRot(ref float mouseY)
 		{
 			var currentAngle = NormalizeAngle(m_arms.eulerAngles.x);
@@ -284,56 +487,33 @@ namespace Cqunity
 
 		private void ValidateGroundness()
 		{
-			
+			bIsGrounded = false;
 		}
 
 		private void ValidateArms()
 		{
-			
+			m_arms.position = transform.position + transform.TransformVector(m_armPositionOffset);
 		}
 
+		/// <summary>
+		/// 점프 로직
+		/// </summary>
 		private void Jump()
 		{
-			
-		}
-	}
+			// 아직 바닥에 닿지 않음
+			if (!bIsGrounded)
+			{
+				return;
+			}
 
-	public class SmoothRotation
-	{
-		private float m_current = default;
-		private float m_currentVelocity = default;
-
-		public SmoothRotation(float initialValue)
-		{
-			m_current = initialValue;
-		}
-
-		public void Update(float target, float smoothTime, out float result)
-		{
-			m_current = Mathf.SmoothDampAngle(m_current, target, ref m_currentVelocity, smoothTime);
-			result = m_current;
+			// 점프 수행
+			if (Input.GetKeyDown(KeyCode.Space))
+			{
+				m_rigidbody.AddForce(Vector3.up * m_movementConfig.jumpForce, ForceMode.Impulse);
+			}
 		}
 
-		public void SetCurrent(float value)
-		{
-			m_current = value;
-		}
-	}
+		#endregion
 
-	public class SmoothVelocity
-	{
-		private float m_current = default;
-		private float m_currentVelocity = default;
-
-		public void Update(float target, float smoothTime, out float result)
-		{
-			m_current = Mathf.SmoothDamp(m_current, target, ref m_currentVelocity, smoothTime);
-			result = m_current;
-		}
-
-		public void SetCurrent(float value)
-		{
-			m_current = value;
-		}
 	}
 }
